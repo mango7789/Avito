@@ -3,12 +3,15 @@
 import json
 import math
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 
 import numpy as np
 import pyarrow.parquet as pq
 import torch
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
+
+from .losses import prepare_pairwise
 
 NUMERIC = ("f1", "f2", "f3", "f4", "f5")
 COLUMNS = (
@@ -290,7 +293,7 @@ class FeedDataset(IterableDataset):
                     break
 
 
-def collate_feeds(rows):
+def collate_feeds(rows, pairwise_gap=None):
     counts = np.asarray([len(row["item_id"]) for row in rows], dtype=np.int64)
     result = {
         name: torch.from_numpy(np.concatenate([r[name] for r in rows]))
@@ -348,10 +351,21 @@ def collate_feeds(rows):
     result["feed_id"] = np.repeat(np.asarray([r["feed_id"] for r in rows], dtype=np.int32), counts)
     result["item_id"] = np.concatenate([r["item_id"] for r in rows])
     result["candidate_item_id"] = torch.from_numpy(result["item_id"].astype(np.int64))
+    if pairwise_gap is not None:
+        result["_pairwise_layout"] = prepare_pairwise(result, pairwise_gap)
     return result
 
 
-def make_loader(dataset, batch_size, workers, device, resume_batches=0, resume_cursor=None, cursor_batch_size=None):
+def make_loader(
+    dataset,
+    batch_size,
+    workers,
+    device,
+    resume_batches=0,
+    resume_cursor=None,
+    cursor_batch_size=None,
+    pairwise_gap=None,
+):
     if batch_size <= 0 or workers < 0:
         raise ValueError("Invalid feed batch size or worker count")
     generator = torch.Generator().manual_seed(dataset.seed + dataset.epoch)
@@ -384,7 +398,7 @@ def make_loader(dataset, batch_size, workers, device, resume_batches=0, resume_c
         dataset,
         batch_size=batch_size,
         num_workers=workers,
-        collate_fn=collate_feeds,
+        collate_fn=partial(collate_feeds, pairwise_gap=pairwise_gap) if pairwise_gap is not None else collate_feeds,
         pin_memory=torch.device(device).type == "cuda",
         generator=generator,
         **({"multiprocessing_context": "spawn", "prefetch_factor": 2} if workers else {}),

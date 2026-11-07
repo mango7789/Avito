@@ -1160,3 +1160,9 @@ step15–40约5.8万候选/秒，相比上一研发约5.2万高约12%，当前�
 原训练主循环每步分别读取5个loss标量，日志步再分别读取梯度范数、标签均值和预测均值。现将标量打包成一次CPU传输，保留更新前loss/梯度有限性检查、各项指标权重及检查点累计值；读取发生在优化器更新后，仍为GPU工作完成后的墙钟计时。日志步的均值计算也纳入本次计时，不能用异步提交时间冒充吞吐。双卡路径的CPU结果标量先转到主设备再打包，跨卡数据仍经CPU。
 
 同RMSNorm目录从checkpoint1400恢复至PID3011572，日志/tmp/avito-rmsnorm-packed-metrics.log。正式step1420 profile的cudaStreamSynchronize从此前8次降到4次；step1425/1430为65229/65838候选每秒，与旧路径约6.5万重叠，不能声称明确整体提速。loss/梯度有限；step1405旧loss0.64030428、新0.64030517，恢复后仍有小幅数值差异，不声明逐参数一致。完整val/test仍待完成。旧PID2986568已退出，GPU0全量任务保持运行，TB指针已恢复到全量任务。Black120/语法检查通过，没有tests或独立benchmark。
+
+### 11:54 pairwise确定性预处理移入DataLoader worker
+
+将每feed stable位置排序、满足gap的起点及累计可抽样对数放入worker的collate阶段，随数据预取。该部分不使用RNG；主进程仍按feed顺序调用原torch.randint并映射到相对候选索引，数量64、gap≥4、均匀有放回抽样、loss及CPU Torch RNG检查点机制不变。仅训练且启用pairwise时传入loader参数；验证/推理不执行此预处理。临时计划在抽样时取走，不传入模型或双卡切分；无计划或gap不符时保留同步准备路径。
+
+同目录checkpoint1600恢复至PID3030616，日志/tmp/avito-rmsnorm-worker-pairs.log。正式step1620 profile和后续至少1635更新正常；1625/1630/1635吞吐65651/66160/66765候选每秒，旧路径近期约6.5万，仅为小幅窗口变化，尚不能排除共享GPU及批次影响。新增工程监控pair_sampling_seconds，约0.109–0.113秒/5步，对比计算6.0–6.2秒约占1.8%；数据等待仍约0.002秒/5步，未观察到预取增加形成明显等待。不能将CPU抽样继续列为主要瓶颈，也不声称逐参数一致或完整epoch加速。loss/梯度有限，完整val/test仍待完成；GPU0原最佳全量训练不受这次恢复影响。Black120/语法检查通过，没有tests或独立benchmark。

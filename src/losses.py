@@ -39,36 +39,66 @@ def prepare_ranking_layout(batch, device, kind="softmax"):
     return layout
 
 
-def sample_pairwise(batch, pairs_per_feed=64, min_gap=4, generator=None):
-    """Uniformly draw eligible unordered pairs with replacement, without building an M x M matrix.
-
-    Store relative indices per feed so data-parallel splits retain the exact same sampled pairs.
-    Sampling uses the checkpointed CPU Torch RNG before work is dispatched to either GPU.
-    """
-    if pairs_per_feed <= 0 or min_gap <= 0:
-        raise ValueError("Pair count and minimum original-position gap must be positive")
+def prepare_pairwise(batch, min_gap):
+    """Build deterministic pair intervals in a loader worker; do not consume RNG."""
+    if min_gap <= 0:
+        raise ValueError("Minimum original-position gap must be positive")
     counts = batch["counts"]
     positions = batch["position"].detach().cpu().numpy()
-    sampled = np.zeros((len(counts), pairs_per_feed, 2), dtype=np.int64)
+    orders = np.zeros(len(positions), dtype=np.int64)
+    starts_all = np.zeros_like(orders)
+    cumulative_all = np.zeros_like(orders)
     available = np.zeros(len(counts), dtype=bool)
     offset = 0
     for feed, count in enumerate(counts):
-        local = positions[offset : offset + count]
+        section = slice(offset, offset + count)
         offset += count
         if not batch["position_available"][feed] or count < 2:
             continue
+        local = positions[section]
         order = np.argsort(local, kind="stable")
         ranked = local[order]
         starts = np.searchsorted(ranked, ranked + min_gap, side="left")
         cumulative = np.cumsum(count - starts)
         if not cumulative[-1]:
             continue
+        orders[section], starts_all[section], cumulative_all[section] = order, starts, cumulative
+        available[feed] = True
+    return {
+        "gap": min_gap,
+        "orders": orders,
+        "starts": starts_all,
+        "cumulative": cumulative_all,
+        "available": available,
+    }
+
+
+def sample_pairwise(batch, pairs_per_feed=64, min_gap=4, generator=None):
+    """Uniformly draw eligible unordered pairs with replacement, without building an M x M matrix.
+
+    Store relative indices per feed so data-parallel splits retain the exact same sampled pairs.
+    Only deterministic interval preparation may run in workers. Draws still use the
+    checkpointed CPU Torch RNG in feed order before dispatch to either GPU.
+    """
+    if pairs_per_feed <= 0 or min_gap <= 0:
+        raise ValueError("Pair count and minimum original-position gap must be positive")
+    plan = batch.pop("_pairwise_layout", None)
+    if plan is None or plan["gap"] != min_gap:
+        plan = prepare_pairwise(batch, min_gap)
+    counts, available = batch["counts"], plan["available"]
+    sampled = np.zeros((len(counts), pairs_per_feed, 2), dtype=np.int64)
+    offset = 0
+    for feed, count in enumerate(counts):
+        section = slice(offset, offset + count)
+        offset += count
+        if not available[feed]:
+            continue
+        order, starts, cumulative = (plan[name][section] for name in ("orders", "starts", "cumulative"))
         ranks = torch.randint(int(cumulative[-1]), (pairs_per_feed,), generator=generator).numpy()
         better = np.searchsorted(cumulative, ranks, side="right")
         before = cumulative[better] - (count - starts[better])
         worse = starts[better] + ranks - before
         sampled[feed, :, 0], sampled[feed, :, 1] = order[better], order[worse]
-        available[feed] = True
     batch["pairwise_indices"] = torch.from_numpy(sampled)
     batch["pairwise_available"] = available
     return batch

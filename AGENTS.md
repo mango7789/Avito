@@ -2,6 +2,8 @@
 
 ## 最新执行要求与模型配方（优先于下方旧运行记录）
 
+- **11-07 11:54当前RMSNorm PID3030616/tmux avito-rmsnorm**：同目录`20261107_110833_028236`，日志/tmp/avito-rmsnorm-worker-pairs.log，从已核对checkpoint1600恢复。pairwise的stable排序/可抽样区间/累计对数在DataLoader worker预计算，主进程仍按原feed顺序用checkpoint CPU Torch RNG逐feed randint；抽样数量、gap、相对索引和loss保留。只在启用pairwise的训练loader预取，val/test不增加该工作；计划消费后不进入模型或双卡切分。正式step1620 profile完成，至少1635更新正常；后续窗口65651/66160/66765候选每秒，仅略高于原约6.5万，不能排除共享负载/批次差异。新增TB engineering/timing/pair_sampling_seconds，主进程抽样约0.109–0.113秒/5步、占约1.8%，数据等待约0.002秒/5步，CPU抽样不是主要剩余瓶颈。旧PID3011572已退出，GPU0全量PID2797616保持运行，TB跟随GPU0；无新完整val/test，目标仍未达到。恢复时移除或更新已消费的AVITO_PROFILE_STEP=1620。Black120/语法检查通过，无tests/独立benchmark。
+
 - **11-07 11:49当前RMSNorm PID3011572/tmux avito-rmsnorm**：同目录`20261107_110833_028236`，日志/tmp/avito-rmsnorm-packed-metrics.log，从checkpoint1400同配方恢复；模型/优化器/LR/RNG/数据游标及所有执行后端不变。每步5个loss标量与日志步梯度范数/预测均值合成一次CPU传输，保留更新前loss/梯度有限性检查，计时仍等待GPU更新完成。正式step1420 profile的cudaStreamSynchronize由8次降为4次，step1425/1430吞吐65229/65838候选每秒，与之前约6.5万重叠，尚无明确整体加速；loss/梯度有限，无新完整val/test。旧PID2986568已退出；GPU0全量训练PID2797616保持运行，TB跟随GPU0。AVITO_PROFILE_STEP=1420已消费，恢复时须移除或设未来步骤。Black120/语法检查通过，无tests/额外benchmark。
 
 - **11-07 11:42当前RMSNorm PID2986568/tmux avito-rmsnorm**：同目录`20261107_110833_028236`，日志/tmp/avito-rmsnorm-fused-block.log，从checkpoint1100同配方恢复；mixer_norm_backend=parallel_triton_fused_block，保留DIN局部编译和compiled_dropout。新增融合FFN后的残差相加、RMSNorm与可选block skip，明确保留两处BF16舍入，权重/梯度FP32归约；反向复用现有RMS公式并向两个加法输入返回相同dz、向skip返回原gradient。正式step1120 profile及至少1135更新成功，1110/1115/1125窗口旧64236/64713/64562、新65077/65717/65591候选/秒，约1–2%；loss有小幅差异，未完成完整val/test，不声称逐参数一致或10分钟达标。aten::add调用36→28，采样批次不同，不以总profile时间跨批次作严格收益证明。旧PID2951080已退出，GPU0全量任务PID2797616不中断，TB仍跟随GPU0。

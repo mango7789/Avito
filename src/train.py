@@ -911,6 +911,7 @@ def train(config, restored=None):
                 resume_batches=cursor if epoch == start_epoch else 0,
                 resume_cursor=data_cursor if epoch == start_epoch and cursor else None,
                 cursor_batch_size=restored["config"]["batch_size"] if restored else config["batch_size"],
+                pairwise_gap=config["pairwise_gap"] if config["pairwise_weight"] else None,
             )
             data_cursor = {"rows": list(training.resume_rows), "next_worker": training.resume_worker_offset}
             model.train()
@@ -932,6 +933,7 @@ def train(config, restored=None):
                 totals.setdefault(key, 0)
             window_count, window_feeds, window_loss = 0, 0, 0.0
             window_data, window_compute = 0.0, 0.0
+            window_pair_sampling = 0.0
             window_main, window_target_rank, window_target_rank_feeds = 0.0, 0.0, 0
             window_aux, window_aux_feeds = 0.0, 0
             window_pairwise, window_pairwise_feeds = 0.0, 0
@@ -956,7 +958,9 @@ def train(config, restored=None):
                 for active_optimizer in optimizers:
                     active_optimizer.zero_grad(set_to_none=True)
                 if config["pairwise_weight"]:
+                    sampling_start = perf_counter()
                     sample_pairwise(batch, config["pairwise_pairs"], config["pairwise_gap"])
+                    window_pair_sampling += perf_counter() - sampling_start
                 if parallel and len(batch["counts"]) >= 2:
                     logits, main_loss, target_rank, target_rank_feeds, aux_loss, aux_feeds, loss = parallel.backward(
                         batch
@@ -1139,6 +1143,7 @@ def train(config, restored=None):
                             "feeds_per_second": window_feeds / (finished - window_start),
                             "data_seconds": window_data,
                             "compute_seconds": window_compute,
+                            "pair_sampling_seconds": window_pair_sampling,
                             "epoch_progress": totals["feeds"] / training.feed_count,
                             "eta_epoch_seconds": max(training.feed_count - totals["feeds"], 0)
                             / (window_feeds / (finished - window_start)),
@@ -1159,6 +1164,7 @@ def train(config, restored=None):
                         },
                     )
                     window_count, window_feeds, window_loss, window_data, window_compute = 0, 0, 0.0, 0.0, 0.0
+                    window_pair_sampling = 0.0
                     window_main, window_target_rank, window_target_rank_feeds = 0.0, 0.0, 0
                     window_aux, window_aux_feeds = 0.0, 0
                     window_pairwise, window_pairwise_feeds = 0.0, 0
