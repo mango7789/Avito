@@ -1146,3 +1146,11 @@ step15–40约5.8万候选/秒，相比上一研发约5.2万高约12%，当前�
 单层中间激活653557760元素，BF16为1.217GiB。算子形状与耗时支持“FFN大激活读写是主要优化方向”，不等于硬件计数器证明整模型纯memory-bound；还存在矩阵计算、调度和共享GPU影响。CPU数据等待仅每5步约2–3ms。Nsight Compute/Systems已安装，但驱动RmProfilingAdminOnly=1，当前UID1011/CapEff0，未取得硬件级Roofline计数器。按[NVIDIA Roofline方法](https://docs.nvidia.com/nsight-compute/ProfilingGuide/#roofline-charts)，严格区分需要运算量/访存量/实际吞吐等硬件证据。profile的父算子与其kernel会重复展示，不能直接累加所有行百分比；采集窗口不当稳态吞吐。
 
 进一步从同配方checkpoint700恢复至PID2951080，mixer_ffn_kernels=compiled_dropout：前向保留原生native_dropout生成mask，反向用原生算子的公式构图，将mask乘法、GELU导数和bias梯度归约编译融合。没有新增随机采样、参数或学习配方；checkpoint保留优化器/LR/RNG/游标，但编译有浮点差异，不声明逐参数/mask逐值一致。正式step720已采集，融合反向kernel4次合计80.040ms（形状[77898,16,512]，与520批次不同）。相同step715：60745.48→64383.21候选/秒，loss0.64222821→0.64223249；step725：60457.12→64294.58，loss0.63985967→0.63988292。约+6%短窗提升，峰值26.76GiB，仍待整轮/完整val/test。新日志/tmp/avito-rmsnorm-ffn-dropout.log；旧PID2926908已退出，GPU0全量训练不中断。Black120/语法检查通过，无tests/额外benchmark，目标0.4/10分钟未达到。
+
+### 11:42 FFN后残差与RMSNorm融合
+
+资源核对显示数据等待只占近期20窗的0.0363%，GPU2无活动throttle原因、约201W/300W、61℃；NUMA1线程位置也基本本地。该采样不支持继续以加worker、强改CPU亲和性或功耗设置作为主要提速方向，未修改这些系统设置。
+
+新增parallel_triton_fused_block后端，在已有token-mix融合上，合并FFN之后的RMSNorm(values+dropped)及block residual。明确保留加法后的BF16舍入与归一化输出的BF16舍入；FP32统计/仿射梯度、原生随机dropout、模型参数、损失均保留。反向复用已有RMS导数，两条加法支路获得dz，block skip获得输出gradient。FP32 eval/test仍按原生模型公式。
+
+同目录从checkpoint1100恢复至PID2986568，日志/tmp/avito-rmsnorm-fused-block.log，正式step1120采样；至少更新至1135，loss/梯度有限。相同1110/1115/1125窗口：64236/64713/64562→65077/65717/65591候选每秒，约1–2%；1125 loss0.64616722→0.64619538，存在浮点变化，不声明逐参数一致。aten::add调用36→28；对应profile批次77898与83281候选不同，不能把总profile时间直接比较为严格收益。尚无完整轮次/val/test证据，10分钟目标未达成。Black120/语法检查通过，无tests/额外benchmark，GPU0原最佳全量训练继续。

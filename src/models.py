@@ -312,13 +312,16 @@ class TokenMixerBlock(nn.Module):
         self.bf16_mixer_norm = config.bf16_mixer_norm
         self._bf16_normalize = None
         self._fused_mix_normalize = None
+        self._fused_residual_normalize = None
         if self.bf16_mixer_norm:
-            if config.mixer_norm_backend in {"parallel_triton", "parallel_triton_fused_mix"}:
-                from .mixer_norm import mix_rms_norm, rms_norm
+            if config.mixer_norm_backend.startswith("parallel_triton"):
+                from .mixer_norm import mix_rms_norm, residual_rms_norm, rms_norm
 
                 self._bf16_normalize = rms_norm
-                if config.mixer_norm_backend == "parallel_triton_fused_mix":
+                if config.mixer_norm_backend in {"parallel_triton_fused_mix", "parallel_triton_fused_block"}:
                     self._fused_mix_normalize = mix_rms_norm
+                if config.mixer_norm_backend == "parallel_triton_fused_block":
+                    self._fused_residual_normalize = residual_rms_norm
             else:
                 from .onetrans import prepare_fused_norm
 
@@ -344,7 +347,22 @@ class TokenMixerBlock(nn.Module):
                 tokens = self._fused_mix_normalize(tokens, self.mix_norm.weight, eps=self.mix_norm.eps)
         else:
             tokens = self.normalize(self.mix_norm, tokens + token_mix(tokens))
-        tokens = self.normalize(self.ffn_norm, tokens + self.dropout(self.ffn(tokens)))
+        dropped = self.dropout(self.ffn(tokens))
+        if (
+            self.training
+            and self._fused_residual_normalize is not None
+            and tokens.is_cuda
+            and tokens.dtype == torch.bfloat16
+        ):
+            with torch.autocast("cuda", enabled=False):
+                return self._fused_residual_normalize(
+                    tokens,
+                    dropped,
+                    residual if self.block_residual else None,
+                    self.ffn_norm.weight,
+                    eps=self.ffn_norm.eps,
+                )
+        tokens = self.normalize(self.ffn_norm, tokens + dropped)
         return residual + tokens if self.block_residual else tokens
 
     def forward_checkpointed(self, tokens):
@@ -533,9 +551,15 @@ def build_model(config):
 
     if config.mixer_norm not in {"layernorm", "rmsnorm"}:
         raise ValueError("Mixer normalization must be layernorm or rmsnorm")
-    if config.mixer_norm_backend not in {"native", "flash_attn_triton", "parallel_triton", "parallel_triton_fused_mix"}:
+    if config.mixer_norm_backend not in {
+        "native",
+        "flash_attn_triton",
+        "parallel_triton",
+        "parallel_triton_fused_mix",
+        "parallel_triton_fused_block",
+    }:
         raise ValueError("Unknown Mixer normalization backend")
-    if config.mixer_norm_backend in {"parallel_triton", "parallel_triton_fused_mix"} and (
+    if config.mixer_norm_backend.startswith("parallel_triton") and (
         config.mixer_norm != "rmsnorm" or not config.bf16_mixer_norm or config.width > 1024
     ):
         raise ValueError("Parallel RMSNorm requires BF16 Mixer RMSNorm with width <= 1024")

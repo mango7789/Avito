@@ -408,7 +408,7 @@ def parser():
     result.add_argument("--mixer-norm", choices=("layernorm", "rmsnorm"), default="layernorm")
     result.add_argument(
         "--mixer-norm-backend",
-        choices=("flash_attn_triton", "parallel_triton", "parallel_triton_fused_mix"),
+        choices=("flash_attn_triton", "parallel_triton", "parallel_triton_fused_mix", "parallel_triton_fused_block"),
         default="flash_attn_triton",
     )
     result.add_argument("--expansion", type=int, default=4)
@@ -618,7 +618,7 @@ def configuration(argv):
     if config["bf16_mixer_norm"]:
         config.setdefault("mixer_norm_backend", "flash_attn_triton")
     else:
-        if config.get("mixer_norm_backend") in {"parallel_triton", "parallel_triton_fused_mix"}:
+        if config.get("mixer_norm_backend", "").startswith("parallel_triton"):
             raise ValueError("Parallel RMSNorm requires --bf16-mixer-norm")
         config["mixer_norm_backend"] = "native"
     config.setdefault("pairwise_weight", 0.0)

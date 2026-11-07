@@ -100,6 +100,128 @@ def _rms_backward(
 
 
 @triton.jit
+def _residual_rms_forward(
+    X,
+    R,
+    S,
+    W,
+    Y,
+    Z,
+    RSTD,
+    M,
+    INNER,
+    SX0,
+    SX1,
+    SX2,
+    SR0,
+    SR1,
+    SR2,
+    SS0,
+    SS1,
+    SS2,
+    N: tl.constexpr,
+    EPS: tl.constexpr,
+    HAS_SKIP: tl.constexpr,
+    ROWS: tl.constexpr,
+    COLS: tl.constexpr,
+):
+    rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    cols = tl.arange(0, COLS)
+    valid = (rows[:, None] < M) & (cols[None, :] < N)
+    outer, inner = rows // INNER, rows % INNER
+    x = tl.load(X + outer[:, None] * SX0 + inner[:, None] * SX1 + cols[None, :] * SX2, valid, 0)
+    residual = tl.load(R + outer[:, None] * SR0 + inner[:, None] * SR1 + cols[None, :] * SR2, valid, 0)
+    z = (x.to(tl.float32) + residual.to(tl.float32)).to(X.dtype.element_ty).to(tl.float32)
+    rstd = tl.rsqrt(tl.sum(z * z, 1) / N + EPS)
+    weight = tl.load(W + cols, cols < N, 0).to(tl.float32)
+    # Keep the standalone normalization's BF16 output rounding before the block residual.
+    output = (z * rstd[:, None] * weight[None, :]).to(X.dtype.element_ty).to(tl.float32)
+    if HAS_SKIP:
+        skip = tl.load(S + outer[:, None] * SS0 + inner[:, None] * SS1 + cols[None, :] * SS2, valid, 0)
+        output += skip.to(tl.float32)
+    offsets = rows[:, None] * N + cols[None, :]
+    tl.store(Z + offsets, z, valid)
+    tl.store(Y + offsets, output, valid)
+    tl.store(RSTD + rows, rstd, rows < M)
+
+
+class _ResidualRMSNorm(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, values, residual, skip, weight, eps):
+        token_major = values.stride(0) < values.stride(1)
+        x = values.transpose(0, 1) if token_major else values
+        r = residual.transpose(0, 1) if token_major else residual
+        s = (skip.transpose(0, 1) if token_major else skip) if skip is not None else x
+        outer, inner, width = x.shape
+        rows = outer * inner
+        output = torch.empty((outer, inner, width), device=x.device, dtype=x.dtype)
+        norm_input = torch.empty_like(output)
+        rstd = torch.empty(rows, device=x.device, dtype=torch.float32)
+        _residual_rms_forward[(triton.cdiv(rows, 16),)](
+            x,
+            r,
+            s,
+            weight,
+            output,
+            norm_input,
+            rstd,
+            rows,
+            inner,
+            *x.stride(),
+            *r.stride(),
+            *s.stride(),
+            width,
+            eps,
+            skip is not None,
+            16,
+            triton.next_power_of_2(width),
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+        ctx.save_for_backward(norm_input, weight, rstd)
+        ctx.token_major, ctx.has_skip = token_major, skip is not None
+        return output.transpose(0, 1) if token_major else output
+
+    @staticmethod
+    def backward(ctx, gradient):
+        x, weight, rstd = ctx.saved_tensors
+        dy = gradient.transpose(0, 1) if ctx.token_major else gradient
+        outer, inner, width = x.shape
+        rows = outer * inner
+        blocks = triton.cdiv(rows, 16)
+        dx = torch.empty_like(x)
+        partial = torch.empty((blocks, width), device=x.device, dtype=torch.float32)
+        _rms_backward[(blocks,)](
+            x,
+            weight,
+            dy,
+            rstd,
+            dx,
+            partial,
+            rows,
+            inner,
+            *x.stride(),
+            *dy.stride(),
+            width,
+            16,
+            triton.next_power_of_2(width),
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+        dx = dx.transpose(0, 1) if ctx.token_major else dx
+        return dx, dx, gradient if ctx.has_skip else None, partial.sum(0).to(weight.dtype), None
+
+
+def residual_rms_norm(values, residual, skip, weight, eps=1e-5):
+    """Fuse optional block residual + RMSNorm(values + residual), with native sum rounding."""
+    if values.ndim != 3 or not values.is_cuda or not 0 < values.shape[-1] <= 1024:
+        raise ValueError("Fused residual RMSNorm requires CUDA [batch, token, width<=1024]")
+    if residual.shape != values.shape or (skip is not None and skip.shape != values.shape):
+        raise ValueError("RMSNorm residuals must have matching shapes")
+    return _ResidualRMSNorm.apply(values, residual, skip, weight, eps)
+
+
+@triton.jit
 def _mix_rms_tiled_forward(
     X,
     W,
