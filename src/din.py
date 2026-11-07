@@ -84,6 +84,7 @@ class DINFeatures(UnifiedFeatures):
         super().__init__(config)
         del self.separator
         self.fast_execution = config.fast_execution
+        self._compiled_group_activation = None
         self.interest_width = 256 if config.din_softmax_context else 128
         event_width = (
             128
@@ -162,12 +163,21 @@ class DINFeatures(UnifiedFeatures):
         feeds, events, attention, hidden_width = weighted_key.shape
         weighted_key = weighted_key.permute(0, 2, 1, 3).reshape(feeds, attention, events * hidden_width)
         product = torch.bmm(query, weighted_key).reshape(feeds, query.shape[1], events, hidden_width)
+        activation = (
+            self._compiled_group_activation
+            if self.training and self._compiled_group_activation is not None
+            else self.group_activation
+        )
+        weights = activation(product, query_part, key_part)
+        return self.pool_interest(weights, values, mask[:, None])
+
+    def group_activation(self, product, query_part, key_part):
+        """Deterministic activation island, excluding grouping, pooling and checkpointing."""
         hidden = product + query_part.unsqueeze(2) + key_part.unsqueeze(1)
         hidden = F.prelu(hidden, self.alpha_input.to(hidden.dtype))
         hidden = self.activation_hidden(hidden)
         hidden = F.prelu(hidden, self.alpha_hidden.to(hidden.dtype))
-        weights = self.activation_output(hidden).squeeze(-1)
-        return self.pool_interest(weights, values, mask[:, None])
+        return self.activation_output(hidden).squeeze(-1)
 
     def attend_grouped(self, batch, query, query_part, key, key_part, values, mask):
         counts = np.asarray(batch["counts"], dtype=np.int64)

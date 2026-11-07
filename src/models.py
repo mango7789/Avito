@@ -218,6 +218,36 @@ def token_mix(tokens):
     return tokens.reshape(batch, count, count, width // count).transpose(1, 2).reshape(batch, count, width)
 
 
+def bias_gelu(hidden, bias):
+    return F.gelu(hidden + bias.to(hidden.dtype))
+
+
+def bias_gelu_dropout_backward(gradient, mask, hidden, bias, scale):
+    # Keep the original operators and dtype boundaries. Inductor can fuse the
+    # deterministic backward without replacing PyTorch's dropout RNG/mask.
+    dropped_gradient = torch.ops.aten.native_dropout_backward.default(gradient, mask, scale)
+    preactivation = hidden + bias.to(hidden.dtype)
+    hidden_gradient = torch.ops.aten.gelu_backward.default(dropped_gradient, preactivation, approximate="none")
+    return hidden_gradient, hidden_gradient.sum(0).to(bias.dtype)
+
+
+class _BiasGELUDropout(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, hidden, bias, probability, forward_function, backward_function):
+        activated = forward_function(hidden, bias)
+        output, mask = torch.ops.aten.native_dropout.default(activated, probability, True)
+        ctx.save_for_backward(hidden, bias, mask)
+        ctx.scale = 1.0 / (1.0 - probability) if probability < 1.0 else 0.0
+        ctx.backward_function = backward_function
+        return output
+
+    @staticmethod
+    def backward(ctx, gradient):
+        hidden, bias, mask = ctx.saved_tensors
+        hidden_gradient, bias_gradient = ctx.backward_function(gradient, mask, hidden, bias, ctx.scale)
+        return hidden_gradient, bias_gradient, None, None, None
+
+
 class PerTokenFFN(nn.Module):
     def __init__(self, tokens, width, expansion, dropout, activation="gelu"):
         super().__init__()
@@ -235,6 +265,8 @@ class PerTokenFFN(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self._compiled_up = None
         self._compiled_down = None
+        self._compiled_dropout_forward = None
+        self._compiled_dropout_backward = None
         for token in range(tokens):
             nn.init.xavier_uniform_(self.w1[token])
             nn.init.xavier_uniform_(self.w2[token])
@@ -259,6 +291,12 @@ class PerTokenFFN(nn.Module):
     def forward(self, tokens):
         up = self._compiled_up if self.training and self._compiled_up is not None else self.input_activation
         down = self._compiled_down if self.training and self._compiled_down is not None else self.output_projection
+        if self.training and self._compiled_dropout_backward is not None:
+            hidden = torch.einsum("btd,tdh->bth", tokens, self.w1)
+            dropped = _BiasGELUDropout.apply(
+                hidden, self.b1, self.dropout.p, self._compiled_dropout_forward, self._compiled_dropout_backward
+            )
+            return down(dropped)
         return down(self.dropout(up(tokens)))
 
 
@@ -454,25 +492,34 @@ def enable_fast_execution(model):
         model.features.fast_execution = True
 
 
-def compile_for_training(model, mixer_ffn_kernels="native"):
+def compile_for_training(model, mixer_ffn_kernels="native", din_activation_kernels="native"):
     from .onetrans import OneTrans
 
     # Keep optimized native embedding backward; generic compiled scatter can be slow on tiny vocabularies.
     model.features._compiled_event_mlp = compile_shared(model.features.event_mlp.forward)
     if isinstance(model, TokenMixer):
         # PyTorch 2.5 failed both eager-checkpoint/compiled-body resume and
-        # compiled-checkpoint partitioning. Keep recomputed blocks and DIN
-        # native; compiling the standalone event MLP needs neither combination.
-        # DIN runs also retain this scope when smaller batches can store mixer activations.
-        native_blocks = model.checkpoint_mixer or model.features.config.din or mixer_ffn_kernels == "compiled"
+        # compiled-checkpoint partitioning. Keep grouping and recomputed regions
+        # native; independent deterministic activation islands avoid those combinations.
+        native_blocks = model.checkpoint_mixer or model.features.config.din or mixer_ffn_kernels != "native"
         model._compiled_blocks = None if native_blocks else compile_shared(model.blocks.forward)
-        if mixer_ffn_kernels == "compiled":
+        if mixer_ffn_kernels != "native":
             if model.checkpoint_mixer:
                 raise ValueError("Compiled Mixer FFN requires stored Mixer activations")
             for block in model.blocks:
-                # Keep random dropout and fused normalization outside AOT graphs.
-                block.ffn._compiled_up = compile_shared(block.ffn.input_activation)
+                # Random dropout still uses PyTorch's native mask generation.
+                if mixer_ffn_kernels == "compiled_dropout":
+                    if block.ffn.activation != "gelu":
+                        raise ValueError("Fused dropout backward currently requires GELU")
+                    block.ffn._compiled_dropout_forward = compile_shared(bias_gelu)
+                    block.ffn._compiled_dropout_backward = compile_shared(bias_gelu_dropout_backward)
+                else:
+                    block.ffn._compiled_up = compile_shared(block.ffn.input_activation)
                 block.ffn._compiled_down = compile_shared(block.ffn.output_projection)
+        if din_activation_kernels == "compiled":
+            if not model.features.config.din or model.features.config.din_recompute != "off":
+                raise ValueError("Compiled DIN activation requires DIN with stored activations")
+            model.features._compiled_group_activation = compile_shared(model.features.group_activation)
     elif isinstance(model, OneTrans):
         for block in model.blocks:
             block._compiled_sequence_ffn = compile_shared(block.sequence_ffn.forward)

@@ -150,6 +150,7 @@ def write_report(folder, summary):
             ("BF16 Mixer normalization outputs (training only)", model.get("bf16_mixer_norm", False)),
             ("Mixer normalization backend", config.get("mixer_norm_backend", "not recorded")),
             ("Mixer normalization", model.get("mixer_norm", "layernorm")),
+            ("DIN activation kernels", config.get("din_activation_kernels", "native")),
             ("additional normalized DIN context", model.get("din_softmax_context", False)),
             ("DIN query includes user/category/QR", model.get("din_query_context", False)),
             ("LCFN hit+count embeddings", model.get("lcfn", False)),

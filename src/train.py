@@ -145,7 +145,9 @@ class ReplicaTrainer:
         )
         self.host_gradients = torch.empty_like(self.host_weights, pin_memory=self.devices[1].type == "cuda")
         if config.get("compile"):
-            replica = compile_for_training(replica, config.get("mixer_ffn_kernels", "native"))
+            replica = compile_for_training(
+                replica, config.get("mixer_ffn_kernels", "native"), config.get("din_activation_kernels", "native")
+            )
         self.models.append(replica)
         if not self.sequential_replica and restored is not None and restored.get("replica_cuda_rng") is not None:
             torch.cuda.set_rng_state(restored["replica_cuda_rng"], self.devices[1])
@@ -464,7 +466,8 @@ def parser():
         help="Infer test after complete training; use --no-test-infer to disable",
     )
     result.add_argument("--compile", action="store_true", help="Compile the model with dynamic candidate counts")
-    result.add_argument("--mixer-ffn-kernels", choices=("native", "compiled"), default="native")
+    result.add_argument("--mixer-ffn-kernels", choices=("native", "compiled", "compiled_dropout"), default="native")
+    result.add_argument("--din-activation-kernels", choices=("native", "compiled"), default="native")
     return result
 
 
@@ -495,6 +498,7 @@ def configuration(argv):
             "din_recompute",
             "din_chunk_size",
             "mixer_ffn_kernels",
+            "din_activation_kernels",
             "mixer_norm_backend",
         }
         if args.resume:
@@ -563,10 +567,21 @@ def configuration(argv):
     config["output"] = config["output"] or str(new_run(config["model"]))
     config.setdefault("compile", False)
     config.setdefault("mixer_ffn_kernels", "native")
-    if config["mixer_ffn_kernels"] == "compiled" and (
+    config.setdefault("din_activation_kernels", "native")
+    if config["din_activation_kernels"] == "compiled" and (
+        not config["compile"]
+        or config["model"] != "tokenmixer"
+        or not config.get("din", False)
+        or config.get("din_recompute", "on") != "off"
+        or not config.get("fast_execution", False)
+    ):
+        raise ValueError("Compiled DIN activation requires compiled fast TokenMixer/DIN with stored activations")
+    if config["mixer_ffn_kernels"] != "native" and (
         not config["compile"] or config["model"] != "tokenmixer" or config.get("checkpoint_mixer", False)
     ):
         raise ValueError("Compiled Mixer FFN requires compiled TokenMixer with stored activations")
+    if config["mixer_ffn_kernels"] == "compiled_dropout" and config.get("token_ffn_activation", "gelu") != "gelu":
+        raise ValueError("Compiled dropout backward requires GELU")
     config.pop("cuda_graphs", None)
     config.setdefault("eval_amp", "none")
     config.setdefault("attention_heads", 8)
@@ -776,14 +791,18 @@ def train(config, restored=None):
             if model_config.name == "tokenmixer" and (model_config.checkpoint_mixer or model_config.din)
             else "event_mlp_and_blocks"
         )
-        if config["mixer_ffn_kernels"] == "compiled":
+        if config["mixer_ffn_kernels"] != "native":
             config["compile_scope"] = "event_mlp_and_mixer_ffn"
+        if config["mixer_ffn_kernels"] == "compiled_dropout":
+            config["compile_scope"] += "_dropout_backward"
+        if config["din_activation_kernels"] == "compiled":
+            config["compile_scope"] += "_and_din_activation"
         cache = (
             os.environ.get("TORCHINDUCTOR_CACHE_DIR") or config.get("compiler_cache") or str(output / "compiler_cache")
         )
         config["compiler_cache"] = str(Path(cache).resolve())
         os.environ["TORCHINDUCTOR_CACHE_DIR"] = config["compiler_cache"]
-        model = compile_for_training(model, config["mixer_ffn_kernels"])
+        model = compile_for_training(model, config["mixer_ffn_kernels"], config["din_activation_kernels"])
     parallel = (
         ReplicaTrainer(model, model_config, config, config["replica_device"], restored)
         if config["replica_device"]
@@ -1032,10 +1051,13 @@ def train(config, restored=None):
                     operator_profile.stop()
                     events = operator_profile.key_averages()
                     monitor.logger.info(
-                        "Actual training step %s operator profile (profiling overhead included):\n%s\n%s",
+                        "Actual training step %s operator profile (profiling overhead included):\n%s\n%s\n%s",
                         global_step + 1,
                         events.table(sort_by="self_cuda_time_total", row_limit=25),
                         events.table(sort_by="self_cpu_time_total", row_limit=20),
+                        operator_profile.key_averages(group_by_input_shape=True).table(
+                            sort_by="self_cuda_time_total", row_limit=12
+                        ),
                     )
                     monitor.record(
                         "profile", global_step + 1, {"scope": "actual_training_update", "timing_overhead": True}

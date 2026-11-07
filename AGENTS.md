@@ -2,6 +2,10 @@
 
 ## 最新执行要求与模型配方（优先于下方旧运行记录）
 
+- **11-07 11:33当前RMSNorm吞吐研发PID2951080/tmux avito-rmsnorm**：同目录`20261107_110833_028236`，日志/tmp/avito-rmsnorm-ffn-dropout.log，从checkpoint700同配方恢复。先在checkpoint500启用DIN确定性group_activation局部编译（native分组/池化、无重算），正式step520 profile已完成；稳定约6.1万候选/秒。再启用mixer_ffn_kernels=compiled_dropout：保留原生native_dropout的随机mask生成，将dropout backward、GELU backward与bias梯度归约独立编译；无新参数，模型/优化器/LR/RNG/数据游标按检查点恢复，存在浮点变化，不声称逐参数或mask逐值等价。正式step720 profile及后续更新成功，step715/725旧60745/60457、新64383/64295候选/秒，约+6%；峰值约26.8GiB，loss/梯度有限。现有运行须移除或更新过期AVITO_PROFILE_STEP后才能恢复。旧PID2926908/2897204已退出，不重启。
+- **用户要求profile及尽量提高SM有效利用率**：step520形状采样定位主要热点为Mixer FFN，单层[79780,16,512] BF16激活1.217GiB；4层inner dropout前反向合计131.087ms、GELU前反向117.820ms、表中两组主要FFN bmm129.290ms，不能把父算子与kernel重复求和。step720观察到融合dropout/GELU backward kernel4次合计80.040ms（不同批次，仅局部采样）。数据等待约每5步2–3ms，非主要瓶颈；从算子/形状推断访存开销显著，尚不能严格认定整模型纯带宽或纯算力受限。Nsight可用但RmProfilingAdminOnly=1、当前UID1011/CapEff0，不具备硬件计数器读取权限；不改变系统权限。当前同GPU还有其他计算任务，总util100%不代表本任务独占SM。目标0.4/10分钟仍未达到。
+- **仓库已上传**：origin=`git@github.com:mango7789/Avito.git`，初始提交baaeac9已推送main并核对远端SHA；数据/output/model/凭据已忽略。22/443直连超时，仓库本地core.sshCommand使用现有127.0.0.1:18888代理连接ssh.github.com:443，未改全局SSH配置。用户要求关闭misconception-download已完成，其shell/下载子进程均退出；Avito训练/TB保持运行。
+
 - **11-07 11:17 RMSNorm继续融合优化，当前两项正常运行**：GPU2当前PID2897204/tmux avito-rmsnorm，同目录`20261107_110833_028236`、日志/tmp/avito-rmsnorm-tiled.log；从同配方checkpoint200恢复，保留优化器/LR/RNG/数据游标，已更新到225。后端parallel_triton_fused_mix把token_mix+BF16残差加法+RMSNorm融合；保留BF16加法舍入，P为自逆置换，反向dz+P(dz)。首次融合虽copy_约101.9→59.1ms但吞吐仍5.7–5.8万；进一步对同候选完整token tile一次读取、片内transpose，避免分散二次读取。相同215/220/225窗口旧57796/57532/57570、新59891/59826/59839候选/秒，约+3.6–4.0%；loss有微小差异，不能称逐参数一致/严格因果/完整验证。当前约6万，估算完整epoch69分钟，10分钟未达成。FP32 eval/test仍原生RMSNorm。Black120/语法检查通过，无tests/benchmark。
 - GPU0原最佳全量训练PID2797616保持不变，11:17 step965/首轮31.2%、约4.7万候选/秒，训后自动test；当前尚无新submission。TB指针仍跟随该全量运行。RMSNorm此前PID2866207和2885602已正常SIGINT退出，不能按旧PID恢复或重启重复任务。
 

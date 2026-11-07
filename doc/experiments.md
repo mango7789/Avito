@@ -1131,3 +1131,18 @@ step15–40约5.8万候选/秒，相比上一研发约5.2万高约12%，当前�
 同配方从step150恢复，新增parallel_triton_fused_mix执行后端：融合RMSNorm(x+P(x))，明确保留x+P(x)的BF16舍入；P为token_mix的自逆置换，反向为dz+P(dz)。参数、优化器、LR、数据游标和RNG保持；FP32验证/推理仍原生算式。第一版把profile全局copy_从101.897降到59.082ms，但分散读取P(x)增加了内核耗时，稳态吞吐仍5.7–5.8万，没有明确额外收益。
 
 第二版在支持的二次幂宽度/token数下，每程序读取一个候选的完整token tile，并在片内transpose，复用第一次读取；其他形状保留通用分散读取路径。从checkpoint200恢复至PID2897204，日志/tmp/avito-rmsnorm-tiled.log，正式step210采样，后续至少更新到225。相同step215/220/225窗口吞吐分别从57796.40/57531.70/57570.08升到59890.76/59826.48/59838.95候选每秒，约+3.6–4.0%。step215 loss0.64695302→0.64695465，存在浮点差异；共享GPU与恢复影响仍在，不声明逐参数等价或严格因果收益。当前峰值约27.4GiB，尚无该路径完整epoch/val/test；约69分钟/epoch仅为吞吐估计。Black120/语法检查通过，无tests/额外benchmark。GPU0原最佳全量训练继续至step965/首轮31.2%，TB跟随GPU0。
+
+### 11:33 正式训练profile与FFN反向融合
+
+从RMSNorm checkpoint500恢复时启用DIN group_activation局部编译，仅包含确定性加法/PReLU/线性层，分组/池化保持native，din_recompute=off，编译入口沿用RLock。稳态约6.1万候选/秒；正式step520采集CPU/CUDA和输入形状，日志/tmp/avito-rmsnorm-din-compiled.log。
+
+| step520采样项 | CUDA耗时 | 解释 |
+| --- | ---: | --- |
+| 4层FFN内dropout前向/反向 | 66.895 / 64.192ms | 形状[79780,16,512] |
+| 4层FFN GELU前向/反向 | 52.197 / 65.623ms | 不含单列的梯度归约kernel |
+| 两组主要FFN bmm | 68.762 / 60.528ms | 128→512与512→128相关前反向，非全部GEMM |
+| 全模型copy_ | 61.137ms | 不能全部归因于某一层 |
+
+单层中间激活653557760元素，BF16为1.217GiB。算子形状与耗时支持“FFN大激活读写是主要优化方向”，不等于硬件计数器证明整模型纯memory-bound；还存在矩阵计算、调度和共享GPU影响。CPU数据等待仅每5步约2–3ms。Nsight Compute/Systems已安装，但驱动RmProfilingAdminOnly=1，当前UID1011/CapEff0，未取得硬件级Roofline计数器。按[NVIDIA Roofline方法](https://docs.nvidia.com/nsight-compute/ProfilingGuide/#roofline-charts)，严格区分需要运算量/访存量/实际吞吐等硬件证据。profile的父算子与其kernel会重复展示，不能直接累加所有行百分比；采集窗口不当稳态吞吐。
+
+进一步从同配方checkpoint700恢复至PID2951080，mixer_ffn_kernels=compiled_dropout：前向保留原生native_dropout生成mask，反向用原生算子的公式构图，将mask乘法、GELU导数和bias梯度归约编译融合。没有新增随机采样、参数或学习配方；checkpoint保留优化器/LR/RNG/游标，但编译有浮点差异，不声明逐参数/mask逐值一致。正式step720已采集，融合反向kernel4次合计80.040ms（形状[77898,16,512]，与520批次不同）。相同step715：60745.48→64383.21候选/秒，loss0.64222821→0.64223249；step725：60457.12→64294.58，loss0.63985967→0.63988292。约+6%短窗提升，峰值26.76GiB，仍待整轮/完整val/test。新日志/tmp/avito-rmsnorm-ffn-dropout.log；旧PID2926908已退出，GPU0全量训练不中断。Black120/语法检查通过，无tests/额外benchmark，目标0.4/10分钟未达到。
