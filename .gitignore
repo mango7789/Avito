@@ -1,0 +1,32 @@
+# Official data, checkpoints, and experiment outputs
+/data/
+/output/
+/model/
+*.cbm
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.npy
+*.npz
+*.memmap
+
+# Credentials and local environments
+.env
+.env.*
+!.env.example
+*credentials*.json
+kaggle.json
+.venv/
+.conda/
+
+# Python and notebook caches
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.pytest_cache/
+.ruff_cache/
+catboost_info/
+*.log
+.DS_Store
