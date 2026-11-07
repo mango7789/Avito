@@ -364,6 +364,12 @@ def parser():
     result.add_argument("--batch-size", type=int, default=32, help="Feeds per batch; candidate counts vary")
     result.add_argument("--workers", type=int, default=8)
     result.add_argument("--read-batch-size", type=int, default=256)
+    result.add_argument(
+        "--item-vector-transfer",
+        choices=("float32", "int8"),
+        default="float32",
+        help="Retain native int8 item vectors until device transfer; never quantize floating-point vectors",
+    )
     result.add_argument("--threads", type=int, default=8)
     result.add_argument("--device", default="auto")
     result.add_argument("--replica-device", help="Optional second CUDA device; keeps the global batch and LR plan")
@@ -500,6 +506,7 @@ def configuration(argv):
             "mixer_ffn_kernels",
             "din_activation_kernels",
             "mixer_norm_backend",
+            "item_vector_transfer",
         }
         if args.resume:
             # DataLoader worker count affects batch order; retain it during exact replay.
@@ -566,6 +573,7 @@ def configuration(argv):
         raise ValueError("Full refitting does not use a separate validation limit")
     config["output"] = config["output"] or str(new_run(config["model"]))
     config.setdefault("compile", False)
+    config.setdefault("item_vector_transfer", "float32")
     config.setdefault("mixer_ffn_kernels", "native")
     config.setdefault("din_activation_kernels", "native")
     if config["din_activation_kernels"] == "compiled" and (
@@ -895,6 +903,7 @@ def train(config, restored=None):
                 "bf16_mixer_norm": config["bf16_mixer_norm"],
                 "mixer_norm_backend": config["mixer_norm_backend"],
                 "mixer_norm": config["mixer_norm"],
+                "item_vector_transfer": config["item_vector_transfer"],
             },
         )
         if restored is None:
@@ -912,6 +921,7 @@ def train(config, restored=None):
                 resume_cursor=data_cursor if epoch == start_epoch and cursor else None,
                 cursor_batch_size=restored["config"]["batch_size"] if restored else config["batch_size"],
                 pairwise_gap=config["pairwise_gap"] if config["pairwise_weight"] else None,
+                compact_item_vectors=config["item_vector_transfer"] == "int8",
             )
             data_cursor = {"rows": list(training.resume_rows), "next_worker": training.resume_worker_offset}
             model.train()
@@ -934,6 +944,7 @@ def train(config, restored=None):
             window_count, window_feeds, window_loss = 0, 0, 0.0
             window_data, window_compute = 0.0, 0.0
             window_pair_sampling = 0.0
+            window_item_bytes, window_item_fp32_bytes = 0, 0
             window_main, window_target_rank, window_target_rank_feeds = 0.0, 0.0, 0
             window_aux, window_aux_feeds = 0.0, 0
             window_pairwise, window_pairwise_feeds = 0.0, 0
@@ -944,6 +955,9 @@ def train(config, restored=None):
                 if config["max_steps"] and batch_index >= config["max_steps"]:
                     break
                 received = perf_counter()
+                for name in ("item", "history_item"):
+                    window_item_bytes += batch[name].numel() * batch[name].element_size()
+                    window_item_fp32_bytes += batch[name].numel() * 4
                 if global_step + 1 == profile_step:
                     activities = [torch.profiler.ProfilerActivity.CPU]
                     if device.type == "cuda":
@@ -1144,6 +1158,8 @@ def train(config, restored=None):
                             "data_seconds": window_data,
                             "compute_seconds": window_compute,
                             "pair_sampling_seconds": window_pair_sampling,
+                            "item_vector_transfer_mib": window_item_bytes / 2**20,
+                            "item_vector_transfer_ratio": window_item_bytes / max(window_item_fp32_bytes, 1),
                             "epoch_progress": totals["feeds"] / training.feed_count,
                             "eta_epoch_seconds": max(training.feed_count - totals["feeds"], 0)
                             / (window_feeds / (finished - window_start)),
@@ -1165,6 +1181,7 @@ def train(config, restored=None):
                     )
                     window_count, window_feeds, window_loss, window_data, window_compute = 0, 0, 0.0, 0.0, 0.0
                     window_pair_sampling = 0.0
+                    window_item_bytes, window_item_fp32_bytes = 0, 0
                     window_main, window_target_rank, window_target_rank_feeds = 0.0, 0.0, 0
                     window_aux, window_aux_feeds = 0.0, 0
                     window_pairwise, window_pairwise_feeds = 0.0, 0
@@ -1212,6 +1229,7 @@ def train(config, restored=None):
                         ),
                         config["workers"],
                         device,
+                        compact_item_vectors=config["item_vector_transfer"] == "int8",
                     ),
                     device,
                     config["eval_amp"],

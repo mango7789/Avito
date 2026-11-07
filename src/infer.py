@@ -72,7 +72,13 @@ def predict(
         batch_size = min(batch_size, 256)
     data, output = Path(data), Path(output) if output else Path(checkpoint).parent
     dataset = FeedDataset([data / "test"], max_feeds=max_feeds)
-    loader = make_loader(dataset, batch_size, workers, device)
+    loader = make_loader(
+        dataset,
+        batch_size,
+        workers,
+        device,
+        compact_item_vectors=state["config"].get("item_vector_transfer", "float32") == "int8",
+    )
     monitor = RunMonitor(output, tensorboard)
     destination = output / ("diagnostic_predictions.parquet" if max_feeds else "submission.parquet")
     temporary = output / ("." + destination.name + ".partial")
@@ -166,7 +172,13 @@ def predict_validation(
     try:
         result = evaluate(
             model,
-            make_loader(dataset, batch_size, workers, device),
+            make_loader(
+                dataset,
+                batch_size,
+                workers,
+                device,
+                compact_item_vectors=state["config"].get("item_vector_transfer", "float32") == "int8",
+            ),
             device,
             "none",
             monitor,

@@ -62,19 +62,22 @@ def fit_numeric_bins(data, bins, seed=42, sample_size=1_000_000):
     return edges, metadata
 
 
-def item_vectors(table, indices):
+def item_vectors(table, indices, compact=False):
     indices = np.asarray(indices, dtype=np.int64)
     if ((indices < -1) | (indices >= len(table))).any():
         raise ValueError("Embedding index outside the current split's table")
     present = indices >= 0
+    # Keep the official storage dtype only when it is already int8. This is
+    # lossless transport, never quantization of arbitrary floating-point data.
+    dtype = np.int8 if compact and table.dtype == np.int8 else np.float32
     if present.all():
-        return table[indices].astype(np.float32), present
-    vectors = np.zeros((len(indices), 128), dtype=np.float32)
-    vectors[present] = table[indices[present]].astype(np.float32)
+        return table[indices].astype(dtype, copy=False), present
+    vectors = np.zeros((len(indices), 128), dtype=dtype)
+    vectors[present] = table[indices[present]].astype(dtype, copy=False)
     return vectors, present
 
 
-def encode_arrow_batch(batch, embeddings):
+def encode_arrow_batch(batch, embeddings, compact_item_vectors=False):
     """Convert nested Arrow columns in bulk, retaining zero-copy row slices where possible."""
 
     def flatten(name, dtype):
@@ -99,9 +102,9 @@ def encode_arrow_batch(batch, embeddings):
     indices, offsets = flatten("item_id__embedding_idx", np.int64)
     if not np.array_equal(offsets, candidate_offsets):
         raise ValueError("Misaligned item embedding indices")
-    items, present = item_vectors(embeddings, indices)
+    items, present = item_vectors(embeddings, indices, compact=compact_item_vectors)
     indices, history_offsets = flatten("history__item_id__embedding_idx", np.int64)
-    history_items, history_present = item_vectors(embeddings, indices)
+    history_items, history_present = item_vectors(embeddings, indices, compact=compact_item_vectors)
     history_fields = {}
     history_ids, offsets = flatten("history__item_id", np.int64)
     if not np.array_equal(offsets, history_offsets) or (history_ids < 0).any():
@@ -282,7 +285,11 @@ class FeedDataset(IterableDataset):
                         shape=tuple(meta["shape"]),
                         order=meta["order"],
                     )
-                rows = encode_arrow_batch(batch.slice(0, take), tables[root])
+                rows = encode_arrow_batch(
+                    batch.slice(0, take),
+                    tables[root],
+                    compact_item_vectors=getattr(self, "compact_item_vectors", False),
+                )
                 if self.shuffle:
                     rng.shuffle(rows)
                 for row in rows[skip:]:
@@ -328,7 +335,10 @@ def collate_feeds(rows, pairwise_gap=None):
         "history_event_source",
     ):
         example = rows[0][name]
-        padded = np.zeros((len(rows), maximum, *example.shape[1:]), dtype=example.dtype)
+        # Mixed storage dtypes must promote, never cast a floating-point table
+        # into int8 just because the first feed used an int8 table.
+        dtype = np.result_type(*(row[name].dtype for row in rows)) if name == "history_item" else example.dtype
+        padded = np.zeros((len(rows), maximum, *example.shape[1:]), dtype=dtype)
         for index, (row, length) in enumerate(zip(rows, lengths)):
             padded[index, :length] = row[name]
             history_mask[index, :length] = True
@@ -365,6 +375,7 @@ def make_loader(
     resume_cursor=None,
     cursor_batch_size=None,
     pairwise_gap=None,
+    compact_item_vectors=False,
 ):
     if batch_size <= 0 or workers < 0:
         raise ValueError("Invalid feed batch size or worker count")
@@ -394,6 +405,7 @@ def make_loader(
             raise ValueError("Invalid worker row cursor")
     dataset.worker_total_rows = feed_counts
     dataset.resume_worker_offset = next_worker
+    dataset.compact_item_vectors = compact_item_vectors
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -407,14 +419,17 @@ def make_loader(
 
 def to_device(batch, device, *, features_only=False):
     cpu_fields = {"target", "position", "position_available", "pairwise_indices", "pairwise_available"}
-    return {
-        name: (
-            value.to(device, non_blocking=True)
-            if isinstance(value, torch.Tensor) and not (features_only and name in cpu_fields)
-            else value
-        )
-        for name, value in batch.items()
-    }
+    result = {}
+    for name, value in batch.items():
+        if isinstance(value, torch.Tensor) and not (features_only and name in cpu_fields):
+            compact = name in {"item", "history_item"} and value.dtype == torch.int8
+            value = value.to(device, non_blocking=True)
+            if compact:
+                # Explicitly copy the byte tensor first, then cast on the target
+                # device. Every int8 value is represented exactly in float32.
+                value = value.float()
+        result[name] = value
+    return result
 
 
 def split_feed_batch(batch):

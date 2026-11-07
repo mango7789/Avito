@@ -1174,3 +1174,9 @@ step15–40约5.8万候选/秒，相比上一研发约5.2万高约12%，当前�
 目录`output/tokenmixer/20261107_115828_007886/`，GPU1/PID3050103/tmux avito-rmsnorm-small-ffn，日志/tmp/avito-rmsnorm-small-ffn.log。随机初始化seed42、无resume或from_eval；checkpoint0为global_step0/cursor0、history空、两个优化器状态空；checkpoint1为129组AdamW和17张RMSprop表全部step1，模型浮点张量有限。训练配方与原宽版配置的差异仅expansion、设备和新运行路径/缓存/恢复标记。train-only分桶边界逐值相同，未读取val标签拟合。所有数据限制为0，test_infer=true，训后使用best.pt完整test，不上传比赛。
 
 正式step20 profile采集到[77146,16,256] FFN中间激活，单层约0.589GiB BF16；该采样GELU前向26.261ms、inner dropout前向28.821ms、融合dropout/GELU反向50.658ms。父算子与kernel不重复累加。step65/70/75/80/85为77701/78153/77864/77961/78195候选每秒，峰值20.9GiB；同期原宽版约6.5万、峰值28.2GiB。不同GPU且共享其他任务、批次不同，不能认定严格因果加速或质量非劣。完整epoch估算约53分钟，10分钟目标未达到；完整val/test尚未产生。GPU0原最佳全量训练及GPU2原宽RMSNorm继续，当前总共三个训练任务、每卡一个，TB保持跟随GPU0。
+
+### 12:08 官方int8商品向量延后转换为FP32
+
+三个官方split的`item_embeddings/data.meta`均声明int8。此前`item_vectors`在CPU查表后立即扩为FP32，随后经过collate、进程间传递、pin memory和H2D。新增可选执行配置`--item-vector-transfer int8`：仅对原生int8表保留字节表示，缺失与padding仍填0；先复制int8张量到目标设备，再显式`.float()`，模型输入及归一化仍为FP32。整数值−128至127都能由FP32精确表示，没有重新量化。非int8表维持FP32，混合表历史padding会提升dtype以避免截断浮点值；用户向量和其余特征不改。默认float32保持旧路径，新训练的验证及独立验证/test推理按checkpoint配置继承此选项。
+
+窄FFN从完整checkpoint400恢复至PID3081136，同目录，日志/tmp/avito-rmsnorm-small-ffn-int8.log；模型、两个优化器、LR/RNG及数据游标保持，旧PID3050103已退出。正式step420 profile及至少445更新正常，loss/梯度有限。新增TB `engineering/io/item_vector_transfer_mib`与`item_vector_transfer_ratio`统计商品向量逻辑载荷：约208MiB/5步，是相同张量FP32参考大小的0.25；不是全部PCIe流量或硬件计数器。主进程RSS在profile后约3.33GiB，旧路径约5.7GiB；435/440/445吞吐77823/77409/77181候选每秒，与旧路径约7.8万重叠，没有明确额外训练提速。完整val/test尚未通过新路径，因此不声称完整预测逐值一致或推理已加速。GPU0全量及GPU2原宽任务保持运行，TB跟随GPU0。Black120/语法检查通过，无tests/独立benchmark。

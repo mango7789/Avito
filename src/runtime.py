@@ -66,6 +66,8 @@ TB_TAGS = {
         "data_seconds": "engineering/timing/data_seconds",
         "compute_seconds": "engineering/timing/compute_seconds",
         "pair_sampling_seconds": "engineering/timing/pair_sampling_seconds",
+        "item_vector_transfer_mib": "engineering/io/item_vector_transfer_mib",
+        "item_vector_transfer_ratio": "engineering/io/item_vector_transfer_ratio",
         "broadcast_seconds": "engineering/sync/broadcast_seconds",
         "gradient_merge_seconds": "engineering/sync/gradient_merge_seconds",
         "replica_compute_seconds": "engineering/timing/replica_compute_seconds",
