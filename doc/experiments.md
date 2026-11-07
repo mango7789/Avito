@@ -1166,3 +1166,11 @@ step15–40约5.8万候选/秒，相比上一研发约5.2万高约12%，当前�
 将每feed stable位置排序、满足gap的起点及累计可抽样对数放入worker的collate阶段，随数据预取。该部分不使用RNG；主进程仍按feed顺序调用原torch.randint并映射到相对候选索引，数量64、gap≥4、均匀有放回抽样、loss及CPU Torch RNG检查点机制不变。仅训练且启用pairwise时传入loader参数；验证/推理不执行此预处理。临时计划在抽样时取走，不传入模型或双卡切分；无计划或gap不符时保留同步准备路径。
 
 同目录checkpoint1600恢复至PID3030616，日志/tmp/avito-rmsnorm-worker-pairs.log。正式step1620 profile和后续至少1635更新正常；1625/1630/1635吞吐65651/66160/66765候选每秒，旧路径近期约6.5万，仅为小幅窗口变化，尚不能排除共享GPU及批次影响。新增工程监控pair_sampling_seconds，约0.109–0.113秒/5步，对比计算6.0–6.2秒约占1.8%；数据等待仍约0.002秒/5步，未观察到预取增加形成明显等待。不能将CPU抽样继续列为主要瓶颈，也不声称逐参数一致或完整epoch加速。loss/梯度有限，完整val/test仍待完成；GPU0原最佳全量训练不受这次恢复影响。Black120/语法检查通过，没有tests或独立benchmark。
+
+### 12:01 独立窄FFN单模型对照
+
+前述profile指向FFN大激活读写。为了同时观察计算量与排序质量，第三张卡启动从零的容量对照：相对当前RMSNorm配置，仅expansion由4降至2，因此4层Mixer和2层候选attention内FFN中间宽度均为256，原为512。16tokens、128维输出、完整历史、全部输入特征、三塔、学习率/优化器/损失及2epochs完整train/val保持。参数14412262→10069990，减少约30.1%；不得将该结构变化称为等价工程优化。
+
+目录`output/tokenmixer/20261107_115828_007886/`，GPU1/PID3050103/tmux avito-rmsnorm-small-ffn，日志/tmp/avito-rmsnorm-small-ffn.log。随机初始化seed42、无resume或from_eval；checkpoint0为global_step0/cursor0、history空、两个优化器状态空；checkpoint1为129组AdamW和17张RMSprop表全部step1，模型浮点张量有限。训练配方与原宽版配置的差异仅expansion、设备和新运行路径/缓存/恢复标记。train-only分桶边界逐值相同，未读取val标签拟合。所有数据限制为0，test_infer=true，训后使用best.pt完整test，不上传比赛。
+
+正式step20 profile采集到[77146,16,256] FFN中间激活，单层约0.589GiB BF16；该采样GELU前向26.261ms、inner dropout前向28.821ms、融合dropout/GELU反向50.658ms。父算子与kernel不重复累加。step65/70/75/80/85为77701/78153/77864/77961/78195候选每秒，峰值20.9GiB；同期原宽版约6.5万、峰值28.2GiB。不同GPU且共享其他任务、批次不同，不能认定严格因果加速或质量非劣。完整epoch估算约53分钟，10分钟目标未达到；完整val/test尚未产生。GPU0原最佳全量训练及GPU2原宽RMSNorm继续，当前总共三个训练任务、每卡一个，TB保持跟随GPU0。
