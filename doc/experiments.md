@@ -1180,3 +1180,9 @@ step15–40约5.8万候选/秒，相比上一研发约5.2万高约12%，当前�
 三个官方split的`item_embeddings/data.meta`均声明int8。此前`item_vectors`在CPU查表后立即扩为FP32，随后经过collate、进程间传递、pin memory和H2D。新增可选执行配置`--item-vector-transfer int8`：仅对原生int8表保留字节表示，缺失与padding仍填0；先复制int8张量到目标设备，再显式`.float()`，模型输入及归一化仍为FP32。整数值−128至127都能由FP32精确表示，没有重新量化。非int8表维持FP32，混合表历史padding会提升dtype以避免截断浮点值；用户向量和其余特征不改。默认float32保持旧路径，新训练的验证及独立验证/test推理按checkpoint配置继承此选项。
 
 窄FFN从完整checkpoint400恢复至PID3081136，同目录，日志/tmp/avito-rmsnorm-small-ffn-int8.log；模型、两个优化器、LR/RNG及数据游标保持，旧PID3050103已退出。正式step420 profile及至少445更新正常，loss/梯度有限。新增TB `engineering/io/item_vector_transfer_mib`与`item_vector_transfer_ratio`统计商品向量逻辑载荷：约208MiB/5步，是相同张量FP32参考大小的0.25；不是全部PCIe流量或硬件计数器。主进程RSS在profile后约3.33GiB，旧路径约5.7GiB；435/440/445吞吐77823/77409/77181候选每秒，与旧路径约7.8万重叠，没有明确额外训练提速。完整val/test尚未通过新路径，因此不声称完整预测逐值一致或推理已加速。GPU0全量及GPU2原宽任务保持运行，TB跟随GPU0。Black120/语法检查通过，无tests/独立benchmark。
+
+### 12:17 用户撤销缩维对照，512维与int8从0重训
+
+用户明确否定助手自行将FFN中间维512改为256，要求停止GPU1/2的两个对照任务，并将GPU1改为512维、加入int8传输、从0重新训练。旧原宽PID3030616和旧窄FFN PID3081136均已SIGINT退出，原进程组无残留；检查点和日志保留。没有执行先前提出的旧512维检查点迁移方案，也不恢复旧训练。GPU0原最佳train+val全量任务继续。
+
+新目录`output/tokenmixer/20261107_121733_162404/`，GPU1/PID3118982/tmux avito-rmsnorm，日志/tmp/avito-rmsnorm-512-int8-fresh.log。无resume/from_eval，checkpoint0核对global_step0、cursor0、history空、两个优化器状态空；FFN w1=(16,128,512)，参数14412262。RMSNorm、expansion4、int8原生向量传输、16tokens/width128/depth4/候选attention2层/三塔；2epochs、batch1024、8workers、BF16，RMSprop embedding/AdamW其余、峰值LR0.001和5%warmup/cosine，完整train/val及自动test。数值分桶边界来自此前train-only拟合文件，模型和优化器均随机初始化。当前固定这两项运行，后续不得擅自修改维度、追加实验或恢复已停任务。
