@@ -1038,11 +1038,21 @@ def train(config, restored=None):
                 for active_optimizer in optimizers:
                     scaler.step(active_optimizer)
                 scaler.update()
-                loss_value = loss.detach().item()
-                main_value = main_loss.detach().item()
-                target_rank_value = target_rank.detach().item() if target_rank is not None else 0.0
-                aux_value = aux_loss.detach().item() if aux_loss is not None else 0.0
-                pair_value = pair_loss.detach().item() if pair_loss is not None else 0.0
+                log_step = global_step + 1 <= 3 or (global_step + 1) % config["log_every"] == 0
+                # Read scalars together after the optimizer update. Separate .item()
+                # calls each fence the CUDA stream; one packed read also keeps the
+                # existing wall-time accounting anchored to completed GPU work.
+                metric_tensors = [
+                    value.detach().to(device) if value is not None else loss.new_zeros(()).to(device)
+                    for value in (loss, main_loss, target_rank, aux_loss, pair_loss)
+                ]
+                if log_step:
+                    metric_tensors.extend(
+                        value.to(device)
+                        for value in (gradient_norm.detach(), batch["target"].mean(), logits.detach().sigmoid().mean())
+                    )
+                metric_values = torch.stack(metric_tensors).cpu().tolist()
+                loss_value, main_value, target_rank_value, aux_value, pair_value = metric_values[:5]
                 feature_models = parallel.models if parallel and len(batch["counts"]) >= 2 else [model]
                 for name, value in lcfn_totals(feature_models).items():
                     totals[name] = totals.get(name, 0) + value
@@ -1096,7 +1106,7 @@ def train(config, restored=None):
                 window_pairwise_feeds += pair_feeds
                 window_data += received - end
                 window_compute += finished - received
-                if global_step <= 3 or global_step % config["log_every"] == 0:
+                if log_step:
                     monitor.record(
                         "train",
                         global_step,
@@ -1121,9 +1131,9 @@ def train(config, restored=None):
                                 if embedding_optimizer is not None
                                 else optimizer.param_groups[0]["lr"]
                             ),
-                            "gradient_norm": float(gradient_norm),
-                            "positive_rate_batch": batch["target"].mean().item(),
-                            "mean_prediction_batch": logits.detach().sigmoid().mean().item(),
+                            "gradient_norm": metric_values[5],
+                            "positive_rate_batch": metric_values[6],
+                            "mean_prediction_batch": metric_values[7],
                             **lcfn_metrics(window_features),
                             "candidates_per_second": window_count / (finished - window_start),
                             "feeds_per_second": window_feeds / (finished - window_start),

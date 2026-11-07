@@ -1154,3 +1154,9 @@ step15–40约5.8万候选/秒，相比上一研发约5.2万高约12%，当前�
 新增parallel_triton_fused_block后端，在已有token-mix融合上，合并FFN之后的RMSNorm(values+dropped)及block residual。明确保留加法后的BF16舍入与归一化输出的BF16舍入；FP32统计/仿射梯度、原生随机dropout、模型参数、损失均保留。反向复用已有RMS导数，两条加法支路获得dz，block skip获得输出gradient。FP32 eval/test仍按原生模型公式。
 
 同目录从checkpoint1100恢复至PID2986568，日志/tmp/avito-rmsnorm-fused-block.log，正式step1120采样；至少更新至1135，loss/梯度有限。相同1110/1115/1125窗口：64236/64713/64562→65077/65717/65591候选每秒，约1–2%；1125 loss0.64616722→0.64619538，存在浮点变化，不声明逐参数一致。aten::add调用36→28；对应profile批次77898与83281候选不同，不能把总profile时间直接比较为严格收益。尚无完整轮次/val/test证据，10分钟目标未达成。Black120/语法检查通过，无tests/额外benchmark，GPU0原最佳全量训练继续。
+
+### 11:49 训练标量传输合并
+
+原训练主循环每步分别读取5个loss标量，日志步再分别读取梯度范数、标签均值和预测均值。现将标量打包成一次CPU传输，保留更新前loss/梯度有限性检查、各项指标权重及检查点累计值；读取发生在优化器更新后，仍为GPU工作完成后的墙钟计时。日志步的均值计算也纳入本次计时，不能用异步提交时间冒充吞吐。双卡路径的CPU结果标量先转到主设备再打包，跨卡数据仍经CPU。
+
+同RMSNorm目录从checkpoint1400恢复至PID3011572，日志/tmp/avito-rmsnorm-packed-metrics.log。正式step1420 profile的cudaStreamSynchronize从此前8次降到4次；step1425/1430为65229/65838候选每秒，与旧路径约6.5万重叠，不能声称明确整体提速。loss/梯度有限；step1405旧loss0.64030428、新0.64030517，恢复后仍有小幅数值差异，不声明逐参数一致。完整val/test仍待完成。旧PID2986568已退出，GPU0全量任务保持运行，TB指针已恢复到全量任务。Black120/语法检查通过，没有tests或独立benchmark。

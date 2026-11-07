@@ -2,6 +2,8 @@
 
 ## 最新执行要求与模型配方（优先于下方旧运行记录）
 
+- **11-07 11:49当前RMSNorm PID3011572/tmux avito-rmsnorm**：同目录`20261107_110833_028236`，日志/tmp/avito-rmsnorm-packed-metrics.log，从checkpoint1400同配方恢复；模型/优化器/LR/RNG/数据游标及所有执行后端不变。每步5个loss标量与日志步梯度范数/预测均值合成一次CPU传输，保留更新前loss/梯度有限性检查，计时仍等待GPU更新完成。正式step1420 profile的cudaStreamSynchronize由8次降为4次，step1425/1430吞吐65229/65838候选每秒，与之前约6.5万重叠，尚无明确整体加速；loss/梯度有限，无新完整val/test。旧PID2986568已退出；GPU0全量训练PID2797616保持运行，TB跟随GPU0。AVITO_PROFILE_STEP=1420已消费，恢复时须移除或设未来步骤。Black120/语法检查通过，无tests/额外benchmark。
+
 - **11-07 11:42当前RMSNorm PID2986568/tmux avito-rmsnorm**：同目录`20261107_110833_028236`，日志/tmp/avito-rmsnorm-fused-block.log，从checkpoint1100同配方恢复；mixer_norm_backend=parallel_triton_fused_block，保留DIN局部编译和compiled_dropout。新增融合FFN后的残差相加、RMSNorm与可选block skip，明确保留两处BF16舍入，权重/梯度FP32归约；反向复用现有RMS公式并向两个加法输入返回相同dz、向skip返回原gradient。正式step1120 profile及至少1135更新成功，1110/1115/1125窗口旧64236/64713/64562、新65077/65717/65591候选/秒，约1–2%；loss有小幅差异，未完成完整val/test，不声称逐参数一致或10分钟达标。aten::add调用36→28，采样批次不同，不以总profile时间跨批次作严格收益证明。旧PID2951080已退出，GPU0全量任务PID2797616不中断，TB仍跟随GPU0。
 - **瓶颈补充核对**：融合前20窗数据等待比例RMSNorm0.0363%、全量基线0.0260%；GPU0/2无活动throttle原因，功耗约207/201W、限额300W，温度72/61℃；不支持将慢归因于触发功耗/温度降频。GPU2在NUMA1，线程和大部分worker已在本地CPU执行，未强改亲和性或迁移共享页缓存。以上仅当时采样，不代表长期硬件状态。
 
